@@ -13,6 +13,7 @@ import requests
 from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -46,6 +47,12 @@ ADN_BASE = "https://adn.nfse.gov.br"
 START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
 MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
 INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
+
+# >>> NOVO: concorrência (consulta em lotes)
+ADN_WORKERS = int(os.getenv("ADN_WORKERS", "12") or "12")         # quantos NSUs em paralelo
+ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "60") or "60")   # tamanho do lote por rodada
+STOP_ON_FIRST_204 = (os.getenv("STOP_ON_FIRST_204", "1") or "1").strip() not in ("0", "false", "False", "nao", "não")
+CONSEC_204_LIMIT = int(os.getenv("CONSEC_204_LIMIT", "3") or "3") # fallback: para se tiver muitos 204 no lote
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -85,7 +92,7 @@ def norm_text(v: Any) -> str:
     return re.sub(r"\s+", " ", str(v).strip())
 
 def fazer_esta_nao(v: Any) -> bool:
-    return norm_text(v).lower() == "nao"
+    return norm_text(v).lower() == "nao" or norm_text(v).lower() == "não"
 
 def is_vencido(venc: Any) -> bool:
     if not venc:
@@ -309,7 +316,7 @@ def zipar_pasta_em_memoria(pasta_local: str) -> bytes:
     return buf.read()
 
 # =========================================================
-# DOWNLOAD NFS-e
+# DOWNLOAD NFS-e (CONCORRENTE EM LOTES)
 # =========================================================
 def baixar_nfse_mes_anterior_para_pasta(
     s: requests.Session,
@@ -317,75 +324,108 @@ def baixar_nfse_mes_anterior_para_pasta(
     pasta_saida: str,
     start_nsu: int,
     max_nsu: int,
+    workers: int = ADN_WORKERS,
+    batch_size: int = ADN_BATCH_SIZE,
 ) -> Tuple[int, int]:
+    """
+    Busca por NSU (endpoint é 1-por-1), mas executa em paralelo por lotes.
+    - workers: quantas requisições simultâneas
+    - batch_size: quantos NSUs por rodada
+    """
     data_ini, data_fim = mes_anterior_range_dt()
 
-    nsu = int(start_nsu)
+    nsu_atual = int(start_nsu)
     limite = int(start_nsu) + int(max_nsu)
 
     total_salvos = 0
     total_nsu_proc = 0
+    stop_all = False
 
-    while nsu < limite:
+    def fetch_one(nsu: int):
         url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
-
         try:
             r = s.get(url, timeout=60)
+            return nsu, r, None
         except Exception as e:
-            print(f"[NSU {nsu}] ERRO REDE: {e}")
-            nsu += 1
-            continue
+            return nsu, None, e
 
-        if r.status_code == 204:
-            print(f"[NSU {nsu}] Sem conteúdo (204). Encerrando.")
-            break
+    while nsu_atual < limite and not stop_all:
+        fim_lote = min(nsu_atual + batch_size, limite)
+        nsus = list(range(nsu_atual, fim_lote))
 
-        ctype = (r.headers.get("Content-Type") or "").lower()
+        consec_204_in_lote = 0
 
-        if r.status_code >= 400:
-            print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
-            nsu += 1
-            continue
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(fetch_one, n) for n in nsus]
 
-        if "application/json" not in ctype:
-            print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
-            nsu += 1
-            continue
+            for fut in as_completed(futs):
+                nsu, r, err = fut.result()
 
-        try:
-            data = r.json()
-        except Exception as e:
-            print(f"[NSU {nsu}] JSON inválido ({e}).")
-            nsu += 1
-            continue
+                if err:
+                    print(f"[NSU {nsu}] ERRO REDE: {err}")
+                    continue
 
-        total_nsu_proc += 1
+                if r is None:
+                    continue
 
-        # salva bruto
-        raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
-        try:
-            with open(raw_fn, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[NSU {nsu}] Falha ao salvar JSON bruto: {e}")
+                if r.status_code == 204:
+                    consec_204_in_lote += 1
+                    print(f"[NSU {nsu}] Sem conteúdo (204).")
+                    if STOP_ON_FIRST_204:
+                        print(f"   ⛔ STOP_ON_FIRST_204=1 -> encerrando varredura.")
+                        stop_all = True
+                    elif consec_204_in_lote >= CONSEC_204_LIMIT:
+                        print(f"   ⛔ Muitos 204 no lote ({consec_204_in_lote}) -> encerrando varredura.")
+                        stop_all = True
+                    continue
 
-        xmls = find_xmls(data)
-        salvos_nsu = 0
+                # reset se vier algo diferente de 204
+                consec_204_in_lote = 0
 
-        for i, xml in enumerate(xmls, start=1):
-            if xml_in_period(xml, data_ini, data_fim):
-                total_salvos += 1
-                salvos_nsu += 1
-                nome = f"NFS-e_{nsu}_{i}_{total_salvos}.xml"
-                xml_path = os.path.join(pasta_saida, nome)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+
+                if r.status_code >= 400:
+                    print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+                    continue
+
+                if "application/json" not in ctype:
+                    print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+                    continue
+
                 try:
-                    with open(xml_path, "w", encoding="utf-8") as f:
-                        f.write(xml)
+                    data = r.json()
                 except Exception as e:
-                    print(f"[NSU {nsu}] Erro salvando XML {nome}: {e}")
+                    print(f"[NSU {nsu}] JSON inválido ({e}).")
+                    continue
 
-        print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs salvos no período: {salvos_nsu}")
-        nsu += 1
+                total_nsu_proc += 1
+
+                # salva bruto
+                raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
+                try:
+                    with open(raw_fn, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"[NSU {nsu}] Falha ao salvar JSON bruto: {e}")
+
+                xmls = find_xmls(data)
+                salvos_nsu = 0
+
+                for i, xml in enumerate(xmls, start=1):
+                    if xml_in_period(xml, data_ini, data_fim):
+                        total_salvos += 1
+                        salvos_nsu += 1
+                        nome = f"NFS-e_{nsu}_{i}_{total_salvos}.xml"
+                        xml_path = os.path.join(pasta_saida, nome)
+                        try:
+                            with open(xml_path, "w", encoding="utf-8") as f:
+                                f.write(xml)
+                        except Exception as e:
+                            print(f"[NSU {nsu}] Erro salvando XML {nome}: {e}")
+
+                print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs salvos no período: {salvos_nsu}")
+
+        nsu_atual = fim_lote
 
     return total_salvos, total_nsu_proc
 
@@ -417,6 +457,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     work_dir = tempfile.mkdtemp(prefix="nfse_adn_")
     print(f"   📁 Pasta temporária: {work_dir}")
+    print(f"   ⚙️ Concorrência ADN: workers={ADN_WORKERS} | batch_size={ADN_BATCH_SIZE} | stop204={int(STOP_ON_FIRST_204)}")
 
     start_nsu = START_NSU_DEFAULT
     max_nsu = MAX_NSU_DEFAULT
@@ -427,6 +468,8 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         pasta_saida=work_dir,
         start_nsu=start_nsu,
         max_nsu=max_nsu,
+        workers=ADN_WORKERS,
+        batch_size=ADN_BATCH_SIZE,
     )
 
     if total_nsu == 0:
@@ -460,7 +503,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     try:
         zip_bytes = zipar_pasta_em_memoria(work_dir)
-        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs: {total_nsu}")
+        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs processados: {total_nsu}")
     except Exception as e:
         print("❌ Falha ao zipar:", e)
         return
