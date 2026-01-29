@@ -16,19 +16,14 @@ from zoneinfo import ZoneInfo
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from lxml import etree  # Necessário para o primeiro script
+from lxml import etree  # Necessário para parse XML
 
 # =========================================================
-# === SUPABASE (CREDENCIAIS FIXAS - NÃO RECOMENDADO) ======
+# === SUPABASE (CREDENCIAIS FIXAS) ========================
 # =========================================================
-# ATENÇÃO: NÃO É RECOMENDADO deixar credenciais no código!
-# Use variáveis de ambiente em produção.
-
-# Suas credenciais do Supabase
 SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 
-# Tabela e buckets
 TABELA_CERTS = "certifica_dfe"
 BUCKET_IMAGENS = "imagens"
 PASTA_NOTAS = "notas"
@@ -50,7 +45,7 @@ ADN_BASE = "https://adn.nfse.gov.br"
 # Configurações padrão
 START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
 MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
-INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "900") or "900")  # 15min
+INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -200,7 +195,7 @@ def montar_nome_final_arquivo(
     return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
 
 # =========================================================
-# ADN: EXTRAÇÃO XML (para NFS-e)
+# ADN: EXTRAÇÃO XML
 # =========================================================
 def decode_xml_field(value: str) -> Optional[str]:
     if not isinstance(value, str) or not value:
@@ -479,7 +474,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 # =========================================================
 # MAIN LOOP NFS-e
 # =========================================================
-def processar_nfse_todas_empresas():
+def processar_todas_empresas():
     certs = carregar_certificados_validos()
     if not certs:
         print("⚠️ Nenhum certificado encontrado.")
@@ -523,7 +518,7 @@ def diagnostico_rede_basico():
         print(f"[DIAG] GET https://{host} falhou: {e}")
 
 # =========================================================
-# EXECUÇÃO PRINCIPAL (NFS-e)
+# EXECUÇÃO PRINCIPAL
 # =========================================================
 if __name__ == "__main__":
     diagnostico_rede_basico()
@@ -532,7 +527,7 @@ if __name__ == "__main__":
         print("\n\n==================== NOVA VARREDURA NFS-e ====================")
         print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')}")
         try:
-            processar_nfse_todas_empresas()
+            processar_todas_empresas()
         except Exception as e:
             print(f"💥 Erro inesperado no loop: {e}")
 
