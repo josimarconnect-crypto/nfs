@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from lxml import etree  # Necessário para parse XML
+from lxml import etree  # parse XML
 
 # =========================================================
 # === SUPABASE (CREDENCIAIS FIXAS) ========================
@@ -26,6 +26,7 @@ SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 
 TABELA_CERTS = "certifica_dfe"
+TABELA_NSU   = "nsu_nfs"           # <<< sua tabela nova
 BUCKET_IMAGENS = "imagens"
 PASTA_NOTAS = "notas"
 
@@ -43,16 +44,17 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 # =========================================================
 ADN_BASE = "https://adn.nfse.gov.br"
 
-# Configurações padrão
 START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
 MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
 INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
 
-# >>> NOVO: concorrência (consulta em lotes)
-ADN_WORKERS = int(os.getenv("ADN_WORKERS", "12") or "12")         # quantos NSUs em paralelo
-ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "60") or "60")   # tamanho do lote por rodada
-STOP_ON_FIRST_204 = (os.getenv("STOP_ON_FIRST_204", "1") or "1").strip() not in ("0", "false", "False", "nao", "não")
-CONSEC_204_LIMIT = int(os.getenv("CONSEC_204_LIMIT", "3") or "3") # fallback: para se tiver muitos 204 no lote
+# Concorrência
+ADN_WORKERS = int(os.getenv("ADN_WORKERS", "12") or "12")
+ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "60") or "60")
+
+# Parada ao achar 204 (fim do disponível)
+STOP_ON_FIRST_204 = (os.getenv("STOP_ON_FIRST_204", "1") or "1").strip().lower() not in ("0", "false", "nao", "não")
+CONSEC_204_LIMIT = int(os.getenv("CONSEC_204_LIMIT", "3") or "3")
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -92,7 +94,8 @@ def norm_text(v: Any) -> str:
     return re.sub(r"\s+", " ", str(v).strip())
 
 def fazer_esta_nao(v: Any) -> bool:
-    return norm_text(v).lower() == "nao" or norm_text(v).lower() == "não"
+    t = norm_text(v).lower()
+    return t in ("nao", "não")
 
 def is_vencido(venc: Any) -> bool:
     if not venc:
@@ -104,6 +107,91 @@ def is_vencido(venc: Any) -> bool:
         return vdate < hoje_ro()
     except Exception:
         return False
+
+# =========================================================
+# SUPABASE: NSU (salvar/ler último por CNPJ)
+# =========================================================
+def supabase_get_last_nsu(cnpj: str) -> int:
+    """
+    Lê o último NSU salvo na tabela nsu_nfs para este CNPJ.
+    Se não existir, volta START_NSU_DEFAULT.
+    """
+    cnpj = somente_numeros(cnpj)
+    if not cnpj:
+        return START_NSU_DEFAULT
+
+    url = f"{SUPABASE_URL}/rest/v1/{TABELA_NSU}"
+    params = {"select": "id,cnpj,nsu", "cnpj": f"eq.{cnpj}", "limit": "1", "order": "id.desc"}
+    try:
+        r = requests.get(url, headers=supabase_headers(), params=params, timeout=20)
+        if r.status_code >= 400:
+            print(f"   ⚠️ NSU GET falhou ({r.status_code}): {r.text[:200]}")
+            return START_NSU_DEFAULT
+
+        rows = r.json() or []
+        if not rows:
+            return START_NSU_DEFAULT
+
+        nsu_val = rows[0].get("nsu")
+        try:
+            return int(float(nsu_val))
+        except Exception:
+            return START_NSU_DEFAULT
+
+    except Exception as e:
+        print(f"   ⚠️ Erro lendo NSU no Supabase: {e}")
+        return START_NSU_DEFAULT
+
+def supabase_upsert_last_nsu(cnpj: str, nsu: int) -> None:
+    """
+    Atualiza (PATCH) se existir, senão cria (POST) o registro.
+    Guarda SEMPRE o maior NSU.
+    """
+    cnpj = somente_numeros(cnpj)
+    if not cnpj:
+        return
+
+    # Primeiro tenta pegar um registro existente
+    url = f"{SUPABASE_URL}/rest/v1/{TABELA_NSU}"
+    params = {"select": "id,cnpj,nsu", "cnpj": f"eq.{cnpj}", "limit": "1", "order": "id.desc"}
+
+    try:
+        r = requests.get(url, headers=supabase_headers(), params=params, timeout=20)
+        if r.status_code >= 400:
+            print(f"   ⚠️ NSU GET(para upsert) falhou ({r.status_code}): {r.text[:200]}")
+            return
+
+        rows = r.json() or []
+        if rows:
+            row_id = rows[0].get("id")
+            old_nsu = rows[0].get("nsu")
+            try:
+                old_nsu_int = int(float(old_nsu))
+            except Exception:
+                old_nsu_int = -1
+
+            new_nsu = max(old_nsu_int, int(nsu))
+
+            # PATCH no registro existente
+            patch_url = f"{SUPABASE_URL}/rest/v1/{TABELA_NSU}?id=eq.{row_id}"
+            payload = {"cnpj": cnpj, "nsu": float(new_nsu)}
+            pr = requests.patch(patch_url, headers=supabase_headers(is_json=True), json=payload, timeout=20)
+            if pr.status_code in (200, 204):
+                print(f"   ✅ NSU atualizado no Supabase: cnpj={cnpj} nsu={new_nsu}")
+            else:
+                print(f"   ⚠️ NSU PATCH falhou ({pr.status_code}): {pr.text[:200]}")
+            return
+
+        # Não existe -> POST
+        payload = {"cnpj": cnpj, "nsu": float(int(nsu))}
+        pr = requests.post(url, headers=supabase_headers(is_json=True), json=payload, timeout=20)
+        if pr.status_code in (200, 201):
+            print(f"   ✅ NSU criado no Supabase: cnpj={cnpj} nsu={int(nsu)}")
+        else:
+            print(f"   ⚠️ NSU POST falhou ({pr.status_code}): {pr.text[:200]}")
+
+    except Exception as e:
+        print(f"   ⚠️ Erro upsert NSU no Supabase: {e}")
 
 # =========================================================
 # SUPABASE: CERTIFICADOS
@@ -316,7 +404,7 @@ def zipar_pasta_em_memoria(pasta_local: str) -> bytes:
     return buf.read()
 
 # =========================================================
-# DOWNLOAD NFS-e (CONCORRENTE EM LOTES)
+# DOWNLOAD NFS-e (CONCORRENTE EM LOTES) + RETORNA ÚLTIMO NSU
 # =========================================================
 def baixar_nfse_mes_anterior_para_pasta(
     s: requests.Session,
@@ -326,11 +414,10 @@ def baixar_nfse_mes_anterior_para_pasta(
     max_nsu: int,
     workers: int = ADN_WORKERS,
     batch_size: int = ADN_BATCH_SIZE,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     """
-    Busca por NSU (endpoint é 1-por-1), mas executa em paralelo por lotes.
-    - workers: quantas requisições simultâneas
-    - batch_size: quantos NSUs por rodada
+    Retorna: (total_xml_salvos, total_nsu_processados, last_nsu_para_salvar)
+    last_nsu_para_salvar = último nsu "seguro" para retomar depois (normalmente o NSU anterior ao 204, ou o último testado)
     """
     data_ini, data_fim = mes_anterior_range_dt()
 
@@ -339,7 +426,10 @@ def baixar_nfse_mes_anterior_para_pasta(
 
     total_salvos = 0
     total_nsu_proc = 0
+
     stop_all = False
+    first_204_nsu: Optional[int] = None
+    max_nsu_testado = start_nsu - 1
 
     def fetch_one(nsu: int):
         url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
@@ -361,6 +451,9 @@ def baixar_nfse_mes_anterior_para_pasta(
             for fut in as_completed(futs):
                 nsu, r, err = fut.result()
 
+                if nsu > max_nsu_testado:
+                    max_nsu_testado = nsu
+
                 if err:
                     print(f"[NSU {nsu}] ERRO REDE: {err}")
                     continue
@@ -371,8 +464,11 @@ def baixar_nfse_mes_anterior_para_pasta(
                 if r.status_code == 204:
                     consec_204_in_lote += 1
                     print(f"[NSU {nsu}] Sem conteúdo (204).")
+                    if first_204_nsu is None or nsu < first_204_nsu:
+                        first_204_nsu = nsu
+
                     if STOP_ON_FIRST_204:
-                        print(f"   ⛔ STOP_ON_FIRST_204=1 -> encerrando varredura.")
+                        print("   ⛔ STOP_ON_FIRST_204=1 -> encerrando varredura.")
                         stop_all = True
                     elif consec_204_in_lote >= CONSEC_204_LIMIT:
                         print(f"   ⛔ Muitos 204 no lote ({consec_204_in_lote}) -> encerrando varredura.")
@@ -400,7 +496,7 @@ def baixar_nfse_mes_anterior_para_pasta(
 
                 total_nsu_proc += 1
 
-                # salva bruto
+                # salva bruto sempre
                 raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
                 try:
                     with open(raw_fn, "w", encoding="utf-8") as f:
@@ -427,7 +523,15 @@ def baixar_nfse_mes_anterior_para_pasta(
 
         nsu_atual = fim_lote
 
-    return total_salvos, total_nsu_proc
+    # last_nsu_para_salvar:
+    # - se achou 204 (fim), salvamos o nsu anterior ao menor 204 encontrado (para retomar em 204 na próxima)
+    # - senão, salvamos o max_nsu_testado
+    if first_204_nsu is not None:
+        last_nsu_para_salvar = max(start_nsu, first_204_nsu - 1)
+    else:
+        last_nsu_para_salvar = max_nsu_testado
+
+    return total_salvos, total_nsu_proc, int(last_nsu_para_salvar)
 
 # =========================================================
 # FLUXO NFS-e (ADN)
@@ -448,8 +552,16 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         print("⏭️ PULANDO: doc (cnpj/cpf) inválido/ausente.")
         return
 
+    # >>> pega do Supabase o último NSU e começa dali + 1
+    last_saved = supabase_get_last_nsu(doc_alvo)
+    start_nsu = max(0, int(last_saved) + 1)
+
+    max_nsu = MAX_NSU_DEFAULT
+
+    print(f"   🧠 NSU do Supabase: last={last_saved} -> start={start_nsu} | max_nsu={max_nsu}")
+
     try:
-        cert_path, key_path, tmp_dir = criar_arquivos_cert_temp(cert_row)
+        cert_path, key_path, _tmp_dir = criar_arquivos_cert_temp(cert_row)
         s = criar_sessao_adn(cert_path, key_path)
     except Exception as e:
         print("❌ Erro ao criar sessão/cert:", e)
@@ -457,12 +569,9 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     work_dir = tempfile.mkdtemp(prefix="nfse_adn_")
     print(f"   📁 Pasta temporária: {work_dir}")
-    print(f"   ⚙️ Concorrência ADN: workers={ADN_WORKERS} | batch_size={ADN_BATCH_SIZE} | stop204={int(STOP_ON_FIRST_204)}")
+    print(f"   ⚙️ ADN: workers={ADN_WORKERS} | batch_size={ADN_BATCH_SIZE} | stop204={int(STOP_ON_FIRST_204)}")
 
-    start_nsu = START_NSU_DEFAULT
-    max_nsu = MAX_NSU_DEFAULT
-
-    total_xml, total_nsu = baixar_nfse_mes_anterior_para_pasta(
+    total_xml, total_nsu_proc, last_nsu_para_salvar = baixar_nfse_mes_anterior_para_pasta(
         s=s,
         cnpj=doc_alvo,
         pasta_saida=work_dir,
@@ -472,10 +581,19 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         batch_size=ADN_BATCH_SIZE,
     )
 
-    if total_nsu == 0:
-        print("⚠️ Nada processado no ADN.")
+    # >>> atualiza SEMPRE o último NSU no Supabase (mesmo se não achou XML do período)
+    supabase_upsert_last_nsu(doc_alvo, last_nsu_para_salvar)
+
+    if total_nsu_proc == 0:
+        print("⚠️ Nada processado no ADN (nenhum JSON válido).")
         return
 
+    # >>> REGRA NOVA: se foi apenas JSON (nenhum XML do período), NÃO cria ZIP e NÃO faz upload
+    if total_xml == 0:
+        print("ℹ️ Não houve XMLs do período (só JSON bruto). Não cria ZIP / não envia.")
+        return
+
+    # Se tiver XML do período, envia ZIP com tudo que está na pasta (JSON + XML)
     tem_arquivos = False
     for _root, _dirs, files in os.walk(work_dir):
         if files:
@@ -503,7 +621,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     try:
         zip_bytes = zipar_pasta_em_memoria(work_dir)
-        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs processados: {total_nsu}")
+        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs processados: {total_nsu_proc}")
     except Exception as e:
         print("❌ Falha ao zipar:", e)
         return
