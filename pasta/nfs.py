@@ -1,0 +1,540 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import time
+import json
+import base64
+import gzip
+import socket
+import zipfile
+import tempfile
+import requests
+
+from datetime import date, timedelta, datetime
+from typing import Dict, Any, Optional, List, Tuple
+from zoneinfo import ZoneInfo
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from lxml import etree  # Necessário para o primeiro script
+
+# =========================================================
+# === SUPABASE (CREDENCIAIS FIXAS - NÃO RECOMENDADO) ======
+# =========================================================
+# ATENÇÃO: NÃO É RECOMENDADO deixar credenciais no código!
+# Use variáveis de ambiente em produção.
+
+# Suas credenciais do Supabase
+SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+
+# Tabela e buckets
+TABELA_CERTS = "certifica_dfe"
+BUCKET_IMAGENS = "imagens"
+PASTA_NOTAS = "notas"
+
+def supabase_headers(is_json: bool = False) -> Dict[str, str]:
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    if is_json:
+        h["Content-Type"] = "application/json"
+    return h
+
+# =========================================================
+# === CONFIGURAÇÕES NFS-e (ADN) ===========================
+# =========================================================
+ADN_BASE = "https://adn.nfse.gov.br"
+
+# Configurações padrão
+START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
+MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
+INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "900") or "900")  # 15min
+
+# =========================================================
+# FUSO HORÁRIO (RONDÔNIA)
+# =========================================================
+FUSO_RO = ZoneInfo("America/Porto_Velho")
+
+def hoje_ro() -> date:
+    return datetime.now(FUSO_RO).date()
+
+def mes_anterior_codigo() -> str:
+    hoje = hoje_ro()
+    inicio_mes_atual = hoje.replace(day=1)
+    fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
+    return fim_mes_anterior.strftime("%Y%m")
+
+def mes_anterior_range_dt() -> Tuple[datetime, datetime]:
+    hoje = hoje_ro()
+    inicio_mes_atual = hoje.replace(day=1)
+    fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
+    inicio_mes_anterior = fim_mes_anterior.replace(day=1)
+
+    data_ini_dt = datetime(inicio_mes_anterior.year, inicio_mes_anterior.month, inicio_mes_anterior.day, 0, 0, 0)
+    data_fim_dt = datetime(fim_mes_anterior.year, fim_mes_anterior.month, fim_mes_anterior.day, 23, 59, 59)
+    return data_ini_dt, data_fim_dt
+
+# =========================================================
+# HELPERS
+# =========================================================
+def somente_numeros(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\D+", "", str(s))
+
+def norm_text(v: Any) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"\s+", " ", str(v).strip())
+
+def fazer_esta_nao(v: Any) -> bool:
+    return norm_text(v).lower() == "nao"
+
+def is_vencido(venc: Any) -> bool:
+    if not venc:
+        return False
+    try:
+        s = str(venc)[:10]
+        y, m, d = s.split("-")
+        vdate = date(int(y), int(m), int(d))
+        return vdate < hoje_ro()
+    except Exception:
+        return False
+
+# =========================================================
+# SUPABASE: CERTIFICADOS
+# =========================================================
+def carregar_certificados_validos() -> List[Dict[str, Any]]:
+    url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
+    params = {"select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf",fazer'}
+    print("🔎 Buscando certificados na tabela certifica_dfe...")
+    r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
+    r.raise_for_status()
+    certs = r.json() or []
+    print(f"   ✔ {len(certs)} certificados encontrados.")
+    return certs
+
+def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str, str]:
+    pem_b64 = cert_row.get("pem") or ""
+    key_b64 = cert_row.get("key") or ""
+
+    pem_bytes = base64.b64decode(pem_b64)
+    key_bytes = base64.b64decode(key_b64)
+
+    tmp_dir = tempfile.mkdtemp(prefix="nfse_cert_")
+    cert_path = os.path.join(tmp_dir, "cert.pem")
+    key_path  = os.path.join(tmp_dir, "key.pem")
+
+    with open(cert_path, "wb") as f:
+        f.write(pem_bytes)
+    with open(key_path, "wb") as f:
+        f.write(key_bytes)
+
+    print(f"   ✔ Certificado temporário: {cert_path}")
+    return cert_path, key_path, tmp_dir
+
+# =========================================================
+# SUPABASE: STORAGE
+# =========================================================
+def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
+    storage_path = storage_path.lstrip("/")
+    pasta = os.path.dirname(storage_path).replace("\\", "/")
+    arquivo = os.path.basename(storage_path)
+
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET_IMAGENS}"
+    headers = supabase_headers(is_json=True)
+
+    payload = {
+        "prefix": pasta,
+        "search": arquivo,
+        "limit": 100,
+        "offset": 0,
+        "sortBy": {"column": "name", "order": "asc"},
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code != 200:
+            print(f"   ⚠️ LIST retornou {r.status_code} ao checar {storage_path}: {r.text[:200]}")
+            return False
+
+        itens = r.json() or []
+        existe = any((i.get("name") == arquivo) for i in itens)
+        if existe:
+            print(f"   ⚠️ Já existe no storage: {storage_path}")
+        return existe
+
+    except Exception as e:
+        print(f"   ⚠️ Erro ao checar existência no storage (LIST) ({storage_path}): {e}")
+        return False
+
+def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = "application/zip") -> bool:
+    storage_path = storage_path.lstrip("/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{storage_path}"
+    headers = supabase_headers()
+    headers["Content-Type"] = content_type
+
+    try:
+        r = requests.post(url, headers=headers, data=conteudo, timeout=180)
+        if r.status_code in (200, 201):
+            print(f"   🎉 Upload OK: {storage_path}")
+            return True
+        print(f"   ❌ Upload erro ({r.status_code}) {storage_path}: {r.text[:400]}")
+        return False
+    except Exception as e:
+        print(f"   ❌ Erro upload ({storage_path}): {e}")
+        return False
+
+def montar_nome_final_arquivo(
+    base_name: str,
+    user: str,
+    codi: Optional[int],
+    mes_cod: str,
+    doc: str,
+) -> str:
+    doc_clean = somente_numeros(doc) or "sem-doc"
+    cod_str = str(codi) if codi is not None else "0"
+    email = user or "sem-user"
+    return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
+
+# =========================================================
+# ADN: EXTRAÇÃO XML (para NFS-e)
+# =========================================================
+def decode_xml_field(value: str) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+
+    if value.lstrip().startswith("<"):
+        return value
+
+    try:
+        b = base64.b64decode(value, validate=False)
+    except Exception:
+        return None
+
+    try:
+        return gzip.decompress(b).decode("utf-8", errors="replace")
+    except Exception:
+        try:
+            return b.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+def find_xmls(data: Any) -> List[str]:
+    xmls: List[str] = []
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, str):
+                xml = decode_xml_field(v)
+                if xml and xml.strip().startswith("<"):
+                    xmls.append(xml)
+            else:
+                xmls.extend(find_xmls(v))
+    elif isinstance(data, list):
+        for item in data:
+            xmls.extend(find_xmls(item))
+    return xmls
+
+def parse_possible_date(texto: str) -> Optional[datetime]:
+    if not texto:
+        return None
+    t = texto.strip()
+
+    if len(t) >= 10 and t[4:5] == "-" and t[7:8] == "-":
+        try:
+            return datetime.strptime(t[:10], "%Y-%m-%d")
+        except Exception:
+            pass
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(t, fmt)
+        except Exception:
+            pass
+
+    return None
+
+def xml_in_period(xml_str: str, data_ini: datetime, data_fim: datetime) -> bool:
+    try:
+        root = etree.fromstring(xml_str.encode("utf-8", errors="ignore"))
+        nodes = root.xpath(
+            "//*[contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'data') "
+            "or contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'compet')]"
+        )
+        for n in nodes:
+            dt = parse_possible_date((n.text or "").strip())
+            if dt and data_ini <= dt <= data_fim:
+                return True
+    except Exception:
+        pass
+    return False
+
+# =========================================================
+# SESSÃO mTLS (ADN)
+# =========================================================
+def criar_sessao_adn(cert_path: str, key_path: str) -> requests.Session:
+    s = requests.Session()
+    s.cert = (cert_path, key_path)
+    s.verify = True
+    s.headers.update({
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    })
+
+    retries = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
+
+# =========================================================
+# ZIP BUILDER
+# =========================================================
+def zipar_pasta_em_memoria(pasta_local: str) -> bytes:
+    buf = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(pasta_local):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, pasta_local).replace("\\", "/")
+                z.write(full, rel)
+    buf.seek(0)
+    return buf.read()
+
+# =========================================================
+# DOWNLOAD NFS-e
+# =========================================================
+def baixar_nfse_mes_anterior_para_pasta(
+    s: requests.Session,
+    cnpj: str,
+    pasta_saida: str,
+    start_nsu: int,
+    max_nsu: int,
+) -> Tuple[int, int]:
+    data_ini, data_fim = mes_anterior_range_dt()
+
+    nsu = int(start_nsu)
+    limite = int(start_nsu) + int(max_nsu)
+
+    total_salvos = 0
+    total_nsu_proc = 0
+
+    while nsu < limite:
+        url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
+
+        try:
+            r = s.get(url, timeout=60)
+        except Exception as e:
+            print(f"[NSU {nsu}] ERRO REDE: {e}")
+            nsu += 1
+            continue
+
+        if r.status_code == 204:
+            print(f"[NSU {nsu}] Sem conteúdo (204). Encerrando.")
+            break
+
+        ctype = (r.headers.get("Content-Type") or "").lower()
+
+        if r.status_code >= 400:
+            print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+            nsu += 1
+            continue
+
+        if "application/json" not in ctype:
+            print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+            nsu += 1
+            continue
+
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"[NSU {nsu}] JSON inválido ({e}).")
+            nsu += 1
+            continue
+
+        total_nsu_proc += 1
+
+        # salva bruto
+        raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
+        try:
+            with open(raw_fn, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[NSU {nsu}] Falha ao salvar JSON bruto: {e}")
+
+        xmls = find_xmls(data)
+        salvos_nsu = 0
+
+        for i, xml in enumerate(xmls, start=1):
+            if xml_in_period(xml, data_ini, data_fim):
+                total_salvos += 1
+                salvos_nsu += 1
+                nome = f"NFS-e_{nsu}_{i}_{total_salvos}.xml"
+                xml_path = os.path.join(pasta_saida, nome)
+                try:
+                    with open(xml_path, "w", encoding="utf-8") as f:
+                        f.write(xml)
+                except Exception as e:
+                    print(f"[NSU {nsu}] Erro salvando XML {nome}: {e}")
+
+        print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs salvos no período: {salvos_nsu}")
+        nsu += 1
+
+    return total_salvos, total_nsu_proc
+
+# =========================================================
+# FLUXO NFS-e (ADN)
+# =========================================================
+def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
+    empresa = cert_row.get("empresa") or ""
+    user = cert_row.get("user") or ""
+    codi = cert_row.get("codi")
+    venc = cert_row.get("vencimento")
+    doc_raw = cert_row.get("cnpj/cpf") or ""
+    doc_alvo = somente_numeros(doc_raw) or ""
+
+    print("\n\n========================================================")
+    print(f"🏢 NFS-e | empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
+    print("========================================================")
+
+    if not doc_alvo or len(doc_alvo) < 11:
+        print("⏭️ PULANDO: doc (cnpj/cpf) inválido/ausente.")
+        return
+
+    try:
+        cert_path, key_path, tmp_dir = criar_arquivos_cert_temp(cert_row)
+        s = criar_sessao_adn(cert_path, key_path)
+    except Exception as e:
+        print("❌ Erro ao criar sessão/cert:", e)
+        return
+
+    work_dir = tempfile.mkdtemp(prefix="nfse_adn_")
+    print(f"   📁 Pasta temporária: {work_dir}")
+
+    start_nsu = START_NSU_DEFAULT
+    max_nsu = MAX_NSU_DEFAULT
+
+    total_xml, total_nsu = baixar_nfse_mes_anterior_para_pasta(
+        s=s,
+        cnpj=doc_alvo,
+        pasta_saida=work_dir,
+        start_nsu=start_nsu,
+        max_nsu=max_nsu,
+    )
+
+    if total_nsu == 0:
+        print("⚠️ Nada processado no ADN.")
+        return
+
+    tem_arquivos = False
+    for _root, _dirs, files in os.walk(work_dir):
+        if files:
+            tem_arquivos = True
+            break
+
+    if not tem_arquivos:
+        print("⚠️ Pasta vazia. Não envia ZIP.")
+        return
+
+    mes_cod = mes_anterior_codigo()
+    base_name = f"NFSE_{mes_cod}.zip"
+    nome_final = montar_nome_final_arquivo(
+        base_name=base_name,
+        user=user,
+        codi=codi,
+        mes_cod=mes_cod,
+        doc=doc_alvo or doc_raw,
+    )
+    storage_path = f"{PASTA_NOTAS}/{nome_final}"
+
+    if arquivo_ja_existe_no_storage(storage_path):
+        print(f"⤵ Já existe no storage. Não reenvia: {storage_path}")
+        return
+
+    try:
+        zip_bytes = zipar_pasta_em_memoria(work_dir)
+        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs: {total_nsu}")
+    except Exception as e:
+        print("❌ Falha ao zipar:", e)
+        return
+
+    ok = upload_para_storage(storage_path, zip_bytes, content_type="application/zip")
+    if ok:
+        print(f"✅ NFS-e enviado: {storage_path}")
+    else:
+        print(f"❌ Falhou upload NFS-e: {storage_path}")
+
+# =========================================================
+# MAIN LOOP NFS-e
+# =========================================================
+def processar_nfse_todas_empresas():
+    certs = carregar_certificados_validos()
+    if not certs:
+        print("⚠️ Nenhum certificado encontrado.")
+        return
+
+    hoje = hoje_ro()
+
+    for cert_row in certs:
+        empresa = cert_row.get("empresa") or "(sem empresa)"
+        user = cert_row.get("user") or ""
+        venc = cert_row.get("vencimento")
+        fazer = cert_row.get("fazer")
+
+        if fazer_esta_nao(fazer):
+            print(f"\n⏭️ PULANDO (fazer='nao'): {empresa} | user: {user}")
+            continue
+
+        if is_vencido(venc):
+            print(f"\n⏭️ PULANDO (CERT VENCIDO): {empresa} | user: {user} | venc: {venc} | hoje: {hoje.isoformat()}")
+            continue
+
+        try:
+            fluxo_nfse_para_empresa(cert_row)
+        except Exception as e:
+            print(f"❌ Erro inesperado em {empresa}: {e}")
+
+def diagnostico_rede_basico():
+    host = "adn.nfse.gov.br"
+    print("\n[DIAG] Rede: diagnóstico rápido...")
+    try:
+        ip = socket.gethostbyname(host)
+        print(f"[DIAG] DNS OK: {host} -> {ip}")
+    except Exception as e:
+        print(f"[DIAG] DNS FALHOU: {e}")
+        return
+
+    try:
+        r = requests.get(f"https://{host}", timeout=(10, 20))
+        print(f"[DIAG] GET https://{host} -> {r.status_code}")
+    except Exception as e:
+        print(f"[DIAG] GET https://{host} falhou: {e}")
+
+# =========================================================
+# EXECUÇÃO PRINCIPAL (NFS-e)
+# =========================================================
+if __name__ == "__main__":
+    diagnostico_rede_basico()
+
+    while True:
+        print("\n\n==================== NOVA VARREDURA NFS-e ====================")
+        print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')}")
+        try:
+            processar_nfse_todas_empresas()
+        except Exception as e:
+            print(f"💥 Erro inesperado no loop: {e}")
+
+        print(f"🕒 Aguardando {INTERVALO_LOOP_SEGUNDOS} segundos...\n")
+        time.sleep(INTERVALO_LOOP_SEGUNDOS)
