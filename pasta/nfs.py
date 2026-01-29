@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-NFS-e (ADN) - Captura incremental por NSU + salva XMLs "soltos" no Storage
-e gera ZIP do mês anterior automaticamente (na virada do mês).
+NFS-e (ADN) - Captura incremental por NSU + salva XMLs "soltos" no Supabase Storage
++ gera ZIP do mês anterior quando ainda não existir (QUALQUER DIA do mês).
 
-✅ Salva XML individual a cada NSU (somente se for do mês-alvo = mês anterior)
+✅ Salva XML individual a cada NSU (somente se for do mês anterior)
 ✅ Dedup por hash do XML (não duplica no Storage)
 ✅ NSU salvo por CNPJ na tabela nsu_nfs (ponteiro incremental)
-✅ Trata respostas que DEVEM pular e NÃO avançar NSU:
-   - 404 JSON com StatusProcessamento=NENHUM_DOCUMENTO_LOCALIZADO
-   - 400 JSON com StatusProcessamento=REJEICAO/REJEIÇÃO (ex.: E2214)
-✅ Gera/atualiza ZIP do mês anterior no início do mês (dia 1..N)
-   - monta ZIP a partir dos XMLs soltos no Storage
-   - faz upload com upsert (sobrescreve o ZIP do mês)
+✅ Se vier 404 NENHUM_DOCUMENTO_LOCALIZADO -> para empresa, NÃO avança NSU
+✅ Se vier 400 REJEICAO (ex.: E2214) -> para empresa, NÃO avança NSU
+✅ Se vier 429 Too Many Requests -> cooldown e para lote (evita martelar)
+✅ ZIP do mês anterior:
+   - se existir XML em nfse_xml e o ZIP do mês ainda NÃO existir => gera ZIP (qualquer dia)
+   - opcional: se quiser "atualizar sempre", ligue ZIP_UPSERT=1 (env)
+
+Requisitos:
+  pip install requests lxml
+
+Observação importante:
+  - E2214 = "Erro Cadeia de Certificação" não “libera em 1h”. É problema de cadeia/certificado.
 """
 
 import os
@@ -24,6 +30,7 @@ import socket
 import zipfile
 import tempfile
 import hashlib
+import threading
 import requests
 
 from datetime import date, timedelta, datetime
@@ -46,6 +53,7 @@ TABELA_NSU   = "nsu_nfs"
 
 BUCKET_STORAGE = "imagens"
 
+# Onde salva XML e ZIP no Storage
 PASTA_XML  = "nfse_xml"   # XML solto
 PASTA_ZIPS = "notas"      # ZIP do mês
 
@@ -67,15 +75,12 @@ START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
 MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
 INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
 
-# Concorrência
-ADN_WORKERS = int(os.getenv("ADN_WORKERS", "12") or "12")
-ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "60") or "60")
+# ✅ Defaults mais conservadores pra evitar 429
+ADN_WORKERS = int(os.getenv("ADN_WORKERS", "2") or "2")
+ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "10") or "10")
 
-# Parar no 204
-STOP_ON_FIRST_204 = (os.getenv("STOP_ON_FIRST_204", "1") or "1").strip().lower() not in ("0", "false", "nao", "não")
-
-# Geração automática do ZIP no começo do mês (dia 1..N)
-ZIP_DIA_LIMITE = int(os.getenv("ZIP_DIA_LIMITE", "3") or "3")
+# Se quiser que o ZIP seja sempre "atualizado" (sobrescrever) quando rodar:
+ZIP_UPSERT = (os.getenv("ZIP_UPSERT", "0") or "0").strip().lower() in ("1", "true", "sim")
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -407,7 +412,7 @@ def criar_sessao_adn(cert_path: str, key_path: str) -> requests.Session:
     return s
 
 # =========================================================
-# CAPTURA: baixar NSUs e salvar XMLs soltos no Storage
+# CAPTURA: salvar XMLs soltos no Storage
 # =========================================================
 def salvar_xml_solto_storage(cnpj: str, mes_cod: str, nsu: int, idx: int, xml_str: str) -> bool:
     cnpj = somente_numeros(cnpj)
@@ -433,6 +438,9 @@ def _extrair_codigo_erro(data_json: dict) -> str:
         pass
     return ""
 
+# =========================================================
+# ✅ FUNÇÃO CORRIGIDA: cancela pendentes + trata 429 cooldown
+# =========================================================
 def baixar_e_salvar_xmls_mes_anterior_por_nsu(
     s: requests.Session,
     cnpj: str,
@@ -443,7 +451,7 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
 ) -> Tuple[int, int, int, bool, str]:
     """
     Retorna:
-      xml_salvos, json_ok, last_nsu_testado, nao_avancar_nsu, motivo_nao_avancar
+      xml_salvos, json_ok, last_nsu_testado, nao_avancar_nsu, motivo
     """
     data_ini, data_fim = mes_anterior_range_dt()
     mes_cod, _mes_slug = mes_anterior_info()
@@ -454,13 +462,16 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
     total_xml_salvos = 0
     total_json_ok = 0
     max_nsu_testado = start_nsu - 1
-    stop_all = False
 
-    # quando True e json_ok==0 => não atualiza NSU (mantém antigo)
     nao_avancar_nsu = False
     motivo_nao_avancar = ""
 
+    stop_event = threading.Event()
+    cooldown_seconds = 0
+
     def fetch_one(nsu: int):
+        if stop_event.is_set():
+            return nsu, None, None
         url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
         try:
             r = s.get(url, timeout=60)
@@ -468,7 +479,19 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
         except Exception as e:
             return nsu, None, e
 
-    while nsu_atual < limite and not stop_all:
+    def stop_now(motivo: str, only_if_no_json_ok: bool = True):
+        nonlocal nao_avancar_nsu, motivo_nao_avancar
+        if (not only_if_no_json_ok) or (total_json_ok == 0):
+            nao_avancar_nsu = True
+            motivo_nao_avancar = motivo
+        stop_event.set()
+
+    while nsu_atual < limite:
+        if cooldown_seconds > 0:
+            print(f"⏸️ Cooldown {cooldown_seconds}s por 429...")
+            time.sleep(cooldown_seconds)
+            cooldown_seconds = 0
+
         fim_lote = min(nsu_atual + batch_size, limite)
         nsus = list(range(nsu_atual, fim_lote))
 
@@ -476,6 +499,11 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
             futs = [ex.submit(fetch_one, n) for n in nsus]
 
             for fut in as_completed(futs):
+                if stop_event.is_set():
+                    for f in futs:
+                        f.cancel()
+                    break
+
                 nsu, r, err = fut.result()
 
                 if nsu > max_nsu_testado:
@@ -487,55 +515,60 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
                 if r is None:
                     continue
 
-                # 204 = fim
-                if r.status_code == 204:
-                    print(f"[NSU {nsu}] Sem conteúdo (204). Encerrando empresa.")
-                    if STOP_ON_FIRST_204:
-                        stop_all = True
-                    continue
-
                 ctype = (r.headers.get("Content-Type") or "").lower()
                 body_txt = (r.text or "").strip()
 
-                # ====== TRATAMENTOS QUE DEVEM PULAR E MANTER NSU ANTIGO ======
+                # 429 => para lote + cooldown
+                if r.status_code == 429:
+                    print(f"[NSU {nsu}] HTTP 429 (Too Many Requests). Parando lote e aguardando.")
+                    ra = r.headers.get("Retry-After")
+                    try:
+                        cooldown_seconds = int(ra) if ra else 60
+                    except Exception:
+                        cooldown_seconds = 60
 
-                # 404 + JSON + StatusProcessamento=NENHUM_DOCUMENTO_LOCALIZADO
+                    # se ainda não teve nenhum 200, não avança NSU
+                    if total_json_ok == 0:
+                        stop_now("RATE_LIMIT_429", only_if_no_json_ok=True)
+                    else:
+                        stop_event.set()
+                    break
+
+                # 204 => fim da empresa
+                if r.status_code == 204:
+                    print(f"[NSU {nsu}] Sem conteúdo (204). Encerrando empresa.")
+                    stop_event.set()
+                    break
+
+                # 404 + JSON + NENHUM_DOCUMENTO_LOCALIZADO => para empresa e mantém NSU antigo se não teve 200
                 if r.status_code == 404 and "application/json" in ctype:
                     try:
                         data_404 = r.json()
                         st = str(data_404.get("StatusProcessamento") or "").upper().strip()
                         if st == "NENHUM_DOCUMENTO_LOCALIZADO":
-                            print(f"[NSU {nsu}] NENHUM_DOCUMENTO_LOCALIZADO (404). Pulando empresa e mantendo NSU antigo.")
-                            if total_json_ok == 0:
-                                nao_avancar_nsu = True
-                                motivo_nao_avancar = "NENHUM_DOCUMENTO_LOCALIZADO"
-                            stop_all = True
-                            continue
+                            print(f"[NSU {nsu}] NENHUM_DOCUMENTO_LOCALIZADO (404). Parando empresa.")
+                            stop_now("NENHUM_DOCUMENTO_LOCALIZADO", only_if_no_json_ok=True)
+                            break
                     except Exception:
                         pass
 
-                # 400 + JSON + StatusProcessamento=REJEICAO/REJEIÇÃO (ex.: E2214)
+                # 400 + JSON + REJEICAO => para empresa e mantém NSU antigo se não teve 200
                 if r.status_code == 400 and "application/json" in ctype:
                     try:
                         data_400 = r.json()
                         st = str(data_400.get("StatusProcessamento") or "").upper().strip()
                         if st in ("REJEICAO", "REJEIÇÃO"):
                             cod = _extrair_codigo_erro(data_400)
-                            print(f"[NSU {nsu}] REJEICAO (400){(' | Codigo='+cod) if cod else ''}. Pulando empresa e mantendo NSU antigo.")
-                            if total_json_ok == 0:
-                                nao_avancar_nsu = True
-                                motivo_nao_avancar = f"REJEICAO{(':'+cod) if cod else ''}"
-                            stop_all = True
-                            continue
+                            print(f"[NSU {nsu}] REJEICAO (400){(' | Codigo='+cod) if cod else ''}. Parando empresa.")
+                            stop_now(f"REJEICAO{(':'+cod) if cod else ''}", only_if_no_json_ok=True)
+                            break
                     except Exception:
                         pass
 
-                # Outros erros
                 if r.status_code >= 400:
                     print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {body_txt[:220]}")
                     continue
 
-                # Deve ser JSON
                 if "application/json" not in ctype:
                     print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {body_txt[:200]}")
                     continue
@@ -550,7 +583,6 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
 
                 xmls = find_xmls(data)
                 salvos_nsu = 0
-
                 for i, xml in enumerate(xmls, start=1):
                     if xml_in_period(xml, data_ini, data_fim):
                         if salvar_xml_solto_storage(cnpj=cnpj, mes_cod=mes_cod, nsu=nsu, idx=i, xml_str=xml):
@@ -558,6 +590,9 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
                             salvos_nsu += 1
 
                 print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs do mês anterior salvos: {salvos_nsu}")
+
+        if stop_event.is_set():
+            break
 
         nsu_atual = fim_lote
 
@@ -587,9 +622,21 @@ def gerar_zip_mes_anterior_para_empresa(cnpj: str, user: str, codi: Optional[int
         print(f"   ℹ️ Sem XMLs do mês {mes_cod} no Storage para cnpj={cnpj}. ZIP não gerado.")
         return
 
+    cod_str = str(codi) if codi is not None else "0"
+    email = user or "sem-user"
+    zip_name = f"NFSE_{mes_cod}.zip"
+    nome_final = f"{mes_cod}-{cod_str}-{cnpj}-{email}-{zip_name}"
+    storage_zip_path = f"{PASTA_ZIPS}/{nome_final}"
+
+    # ✅ regra que você pediu:
+    # - se já existe ZIP e ZIP_UPSERT=0 -> não faz nada
+    if storage_exists(storage_zip_path) and (not ZIP_UPSERT):
+        print(f"   ℹ️ ZIP já existe (não atualiza): {storage_zip_path}")
+        return
+
     print(f"   📦 Montando ZIP do mês {mes_cod} com {len(nomes)} XMLs (cnpj={cnpj})...")
 
-    buf = tempfile.SpooledTemporaryFile(max_size=80 * 1024 * 1024)
+    buf = tempfile.SpooledTemporaryFile(max_size=120 * 1024 * 1024)
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         for nm in nomes:
             obj_path = f"{prefix}/{nm}"
@@ -602,21 +649,17 @@ def gerar_zip_mes_anterior_para_empresa(cnpj: str, user: str, codi: Optional[int
     buf.seek(0)
     zip_bytes = buf.read()
 
-    cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"
-
-    zip_name = f"NFSE_{mes_cod}.zip"
-    nome_final = f"{mes_cod}-{cod_str}-{cnpj}-{email}-{zip_name}"
-    storage_zip_path = f"{PASTA_ZIPS}/{nome_final}"
-
-    ok = storage_upload(storage_zip_path, zip_bytes, "application/zip", upsert=True)
+    ok = storage_upload(storage_zip_path, zip_bytes, "application/zip", upsert=ZIP_UPSERT)
     if ok:
-        print(f"   ✅ ZIP atualizado (upsert): {storage_zip_path}")
+        if ZIP_UPSERT:
+            print(f"   ✅ ZIP criado/atualizado (upsert): {storage_zip_path}")
+        else:
+            print(f"   ✅ ZIP criado: {storage_zip_path}")
     else:
         print(f"   ❌ Falha ao enviar ZIP: {storage_zip_path}")
 
 # =========================================================
-# Fluxos por empresa
+# Fluxo por empresa
 # =========================================================
 def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
@@ -637,7 +680,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
     last_saved = supabase_get_last_nsu(cnpj)
     start_nsu = max(0, int(last_saved) + 1)
     max_nsu = MAX_NSU_DEFAULT
-    print(f"   🧠 NSU Supabase: last={last_saved} -> start={start_nsu} | max_nsu={max_nsu}")
+    print(f"   🧠 NSU Supabase: last={last_saved} -> start={start_nsu} | max_nsu={max_nsu} | workers={ADN_WORKERS} batch={ADN_BATCH_SIZE}")
 
     try:
         cert_path, key_path, _tmp_dir = criar_arquivos_cert_temp(cert_row)
@@ -655,11 +698,10 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         batch_size=ADN_BATCH_SIZE,
     )
 
-    # Regra: se foi um caso para "pular e manter NSU antigo" e não processou nenhum JSON 200
+    # Atualização do NSU
     if nao_avancar_nsu and json_ok == 0:
         print(f"ℹ️ Mantendo NSU antigo (não atualiza Supabase). Motivo: {motivo or 'NAO_AVANCAR'}")
     else:
-        # Só atualiza se teve algum JSON 200 processado (pra não avançar no escuro)
         if json_ok > 0:
             supabase_upsert_last_nsu(cnpj, last_nsu_testado)
         else:
@@ -667,9 +709,8 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     print(f"   🧾 XMLs do mês anterior salvos nesta rodada: {xml_salvos} | JSONs OK: {json_ok}")
 
-    # Gera/atualiza ZIP do mês anterior nos primeiros dias do mês (upsert)
-    if hoje_ro().day <= ZIP_DIA_LIMITE:
-        gerar_zip_mes_anterior_para_empresa(cnpj=cnpj, user=user, codi=codi)
+    # ✅ ZIP: qualquer dia do mês, se tiver XMLs e ainda não tiver ZIP (ou se ZIP_UPSERT=1)
+    gerar_zip_mes_anterior_para_empresa(cnpj=cnpj, user=user, codi=codi)
 
 # =========================================================
 # MAIN LOOP
