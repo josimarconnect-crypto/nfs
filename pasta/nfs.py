@@ -26,7 +26,7 @@ SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 
 TABELA_CERTS = "certifica_dfe"
-TABELA_NSU   = "nsu_nfs"           # <<< sua tabela nova
+TABELA_NSU   = "nsu_nfs"           # <<< sua tabela
 BUCKET_IMAGENS = "imagens"
 PASTA_NOTAS = "notas"
 
@@ -54,7 +54,6 @@ ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "60") or "60")
 
 # Parada ao achar 204 (fim do disponível)
 STOP_ON_FIRST_204 = (os.getenv("STOP_ON_FIRST_204", "1") or "1").strip().lower() not in ("0", "false", "nao", "não")
-CONSEC_204_LIMIT = int(os.getenv("CONSEC_204_LIMIT", "3") or "3")
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -112,10 +111,6 @@ def is_vencido(venc: Any) -> bool:
 # SUPABASE: NSU (salvar/ler último por CNPJ)
 # =========================================================
 def supabase_get_last_nsu(cnpj: str) -> int:
-    """
-    Lê o último NSU salvo na tabela nsu_nfs para este CNPJ.
-    Se não existir, volta START_NSU_DEFAULT.
-    """
     cnpj = somente_numeros(cnpj)
     if not cnpj:
         return START_NSU_DEFAULT
@@ -143,15 +138,10 @@ def supabase_get_last_nsu(cnpj: str) -> int:
         return START_NSU_DEFAULT
 
 def supabase_upsert_last_nsu(cnpj: str, nsu: int) -> None:
-    """
-    Atualiza (PATCH) se existir, senão cria (POST) o registro.
-    Guarda SEMPRE o maior NSU.
-    """
     cnpj = somente_numeros(cnpj)
     if not cnpj:
         return
 
-    # Primeiro tenta pegar um registro existente
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_NSU}"
     params = {"select": "id,cnpj,nsu", "cnpj": f"eq.{cnpj}", "limit": "1", "order": "id.desc"}
 
@@ -172,7 +162,6 @@ def supabase_upsert_last_nsu(cnpj: str, nsu: int) -> None:
 
             new_nsu = max(old_nsu_int, int(nsu))
 
-            # PATCH no registro existente
             patch_url = f"{SUPABASE_URL}/rest/v1/{TABELA_NSU}?id=eq.{row_id}"
             payload = {"cnpj": cnpj, "nsu": float(new_nsu)}
             pr = requests.patch(patch_url, headers=supabase_headers(is_json=True), json=payload, timeout=20)
@@ -182,7 +171,6 @@ def supabase_upsert_last_nsu(cnpj: str, nsu: int) -> None:
                 print(f"   ⚠️ NSU PATCH falhou ({pr.status_code}): {pr.text[:200]}")
             return
 
-        # Não existe -> POST
         payload = {"cnpj": cnpj, "nsu": float(int(nsu))}
         pr = requests.post(url, headers=supabase_headers(is_json=True), json=payload, timeout=20)
         if pr.status_code in (200, 201):
@@ -404,7 +392,9 @@ def zipar_pasta_em_memoria(pasta_local: str) -> bytes:
     return buf.read()
 
 # =========================================================
-# DOWNLOAD NFS-e (CONCORRENTE EM LOTES) + RETORNA ÚLTIMO NSU
+# DOWNLOAD NFS-e (CONCORRENTE EM LOTES)
+#  - Trata 204 como fim
+#  - Trata 404 com StatusProcessamento=NENHUM_DOCUMENTO_LOCALIZADO como "sem documento" (para e NÃO avança NSU)
 # =========================================================
 def baixar_nfse_mes_anterior_para_pasta(
     s: requests.Session,
@@ -414,10 +404,13 @@ def baixar_nfse_mes_anterior_para_pasta(
     max_nsu: int,
     workers: int = ADN_WORKERS,
     batch_size: int = ADN_BATCH_SIZE,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, bool]:
     """
-    Retorna: (total_xml_salvos, total_nsu_processados, last_nsu_para_salvar)
-    last_nsu_para_salvar = último nsu "seguro" para retomar depois (normalmente o NSU anterior ao 204, ou o último testado)
+    Retorna:
+      total_xml_salvos,
+      total_json_ok (200 json processado),
+      last_nsu_para_salvar (quando fizer sentido),
+      no_docs (True quando cair em NENHUM_DOCUMENTO_LOCALIZADO sem processar nenhum JSON)
     """
     data_ini, data_fim = mes_anterior_range_dt()
 
@@ -425,11 +418,14 @@ def baixar_nfse_mes_anterior_para_pasta(
     limite = int(start_nsu) + int(max_nsu)
 
     total_salvos = 0
-    total_nsu_proc = 0
+    total_json_ok = 0
 
     stop_all = False
-    first_204_nsu: Optional[int] = None
     max_nsu_testado = start_nsu - 1
+
+    # se cair no "nenhum documento localizado" sem ter processado nenhum json válido,
+    # consideramos que NÃO devemos avançar o NSU (fica o antigo)
+    no_docs = False
 
     def fetch_one(nsu: int):
         url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
@@ -442,8 +438,6 @@ def baixar_nfse_mes_anterior_para_pasta(
     while nsu_atual < limite and not stop_all:
         fim_lote = min(nsu_atual + batch_size, limite)
         nsus = list(range(nsu_atual, fim_lote))
-
-        consec_204_in_lote = 0
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(fetch_one, n) for n in nsus]
@@ -461,31 +455,38 @@ def baixar_nfse_mes_anterior_para_pasta(
                 if r is None:
                     continue
 
+                # ---- FIM por 204
                 if r.status_code == 204:
-                    consec_204_in_lote += 1
-                    print(f"[NSU {nsu}] Sem conteúdo (204).")
-                    if first_204_nsu is None or nsu < first_204_nsu:
-                        first_204_nsu = nsu
-
-                    if STOP_ON_FIRST_204:
-                        print("   ⛔ STOP_ON_FIRST_204=1 -> encerrando varredura.")
-                        stop_all = True
-                    elif consec_204_in_lote >= CONSEC_204_LIMIT:
-                        print(f"   ⛔ Muitos 204 no lote ({consec_204_in_lote}) -> encerrando varredura.")
-                        stop_all = True
+                    print(f"[NSU {nsu}] Sem conteúdo (204). Encerrando empresa.")
+                    stop_all = True
                     continue
-
-                # reset se vier algo diferente de 204
-                consec_204_in_lote = 0
 
                 ctype = (r.headers.get("Content-Type") or "").lower()
+                body_txt = (r.text or "").strip()
 
+                # ---- CASO DO SEU LOG: 404 com JSON e StatusProcessamento=NENHUM_DOCUMENTO_LOCALIZADO
+                if r.status_code == 404 and "application/json" in ctype:
+                    try:
+                        data_404 = r.json()
+                        st = str(data_404.get("StatusProcessamento") or "").upper().strip()
+                        if st == "NENHUM_DOCUMENTO_LOCALIZADO":
+                            print(f"[NSU {nsu}] NENHUM_DOCUMENTO_LOCALIZADO (404). Pulando empresa e mantendo NSU antigo.")
+                            # se ainda não tivemos nenhum JSON 200, marcamos no_docs para NÃO atualizar NSU
+                            if total_json_ok == 0:
+                                no_docs = True
+                            stop_all = True
+                            continue
+                    except Exception:
+                        pass  # cai no tratamento normal abaixo
+
+                # ---- Outros erros
                 if r.status_code >= 400:
-                    print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+                    print(f"[NSU {nsu}] HTTP {r.status_code} | Content-Type={ctype} | Corpo: {body_txt[:220]}")
                     continue
 
+                # ---- Deve ser JSON
                 if "application/json" not in ctype:
-                    print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {str(r.text)[:200]}")
+                    print(f"[NSU {nsu}] Não-JSON. Content-Type={ctype} | Corpo: {body_txt[:200]}")
                     continue
 
                 try:
@@ -494,9 +495,9 @@ def baixar_nfse_mes_anterior_para_pasta(
                     print(f"[NSU {nsu}] JSON inválido ({e}).")
                     continue
 
-                total_nsu_proc += 1
+                total_json_ok += 1
 
-                # salva bruto sempre
+                # salva bruto sempre (se quiser deixar mais leve, eu removo depois)
                 raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
                 try:
                     with open(raw_fn, "w", encoding="utf-8") as f:
@@ -523,15 +524,18 @@ def baixar_nfse_mes_anterior_para_pasta(
 
         nsu_atual = fim_lote
 
+        # se STOP_ON_FIRST_204=1 e já marcou stop_all, o while termina naturalmente
+        # (no_docs também encerra)
+
     # last_nsu_para_salvar:
-    # - se achou 204 (fim), salvamos o nsu anterior ao menor 204 encontrado (para retomar em 204 na próxima)
-    # - senão, salvamos o max_nsu_testado
-    if first_204_nsu is not None:
-        last_nsu_para_salvar = max(start_nsu, first_204_nsu - 1)
+    # - se no_docs=True e total_json_ok==0 => NÃO queremos avançar, então retornamos start_nsu-1 (vai ser ignorado no fluxo)
+    # - caso contrário, avançamos para o maior NSU testado
+    if no_docs and total_json_ok == 0:
+        last_nsu_para_salvar = start_nsu - 1
     else:
         last_nsu_para_salvar = max_nsu_testado
 
-    return total_salvos, total_nsu_proc, int(last_nsu_para_salvar)
+    return total_salvos, total_json_ok, int(last_nsu_para_salvar), bool(no_docs)
 
 # =========================================================
 # FLUXO NFS-e (ADN)
@@ -552,13 +556,12 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         print("⏭️ PULANDO: doc (cnpj/cpf) inválido/ausente.")
         return
 
-    # >>> pega do Supabase o último NSU e começa dali + 1
+    # pega NSU salvo e começa no próximo
     last_saved = supabase_get_last_nsu(doc_alvo)
     start_nsu = max(0, int(last_saved) + 1)
-
     max_nsu = MAX_NSU_DEFAULT
 
-    print(f"   🧠 NSU do Supabase: last={last_saved} -> start={start_nsu} | max_nsu={max_nsu}")
+    print(f"   🧠 NSU Supabase: last={last_saved} -> start={start_nsu} | max_nsu={max_nsu}")
 
     try:
         cert_path, key_path, _tmp_dir = criar_arquivos_cert_temp(cert_row)
@@ -571,7 +574,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
     print(f"   📁 Pasta temporária: {work_dir}")
     print(f"   ⚙️ ADN: workers={ADN_WORKERS} | batch_size={ADN_BATCH_SIZE} | stop204={int(STOP_ON_FIRST_204)}")
 
-    total_xml, total_nsu_proc, last_nsu_para_salvar = baixar_nfse_mes_anterior_para_pasta(
+    total_xml, total_json_ok, last_nsu_para_salvar, no_docs = baixar_nfse_mes_anterior_para_pasta(
         s=s,
         cnpj=doc_alvo,
         pasta_saida=work_dir,
@@ -581,19 +584,29 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         batch_size=ADN_BATCH_SIZE,
     )
 
-    # >>> atualiza SEMPRE o último NSU no Supabase (mesmo se não achou XML do período)
-    supabase_upsert_last_nsu(doc_alvo, last_nsu_para_salvar)
+    # ✅ REGRA DO JOSIMAR:
+    # Se veio "NENHUM_DOCUMENTO_LOCALIZADO" sem processar nenhum JSON 200,
+    # NÃO atualiza NSU (fica o antigo).
+    if no_docs and total_json_ok == 0:
+        print("ℹ️ Nenhum documento localizado. Mantendo NSU antigo (não atualiza Supabase).")
+    else:
+        # se processou algo (ou avançou normal), atualiza para o maior NSU testado
+        if total_json_ok > 0:
+            supabase_upsert_last_nsu(doc_alvo, last_nsu_para_salvar)
+        else:
+            print("ℹ️ Não atualizou NSU: nenhum JSON válido (200) processado.")
 
-    if total_nsu_proc == 0:
-        print("⚠️ Nada processado no ADN (nenhum JSON válido).")
+    # Se não processou nada, pula
+    if total_json_ok == 0:
+        print("⚠️ Nada processado no ADN (nenhum JSON 200). Pulando empresa.")
         return
 
-    # >>> REGRA NOVA: se foi apenas JSON (nenhum XML do período), NÃO cria ZIP e NÃO faz upload
+    # ✅ REGRA: se foi apenas JSON (nenhum XML do mês anterior), não cria ZIP
     if total_xml == 0:
-        print("ℹ️ Não houve XMLs do período (só JSON bruto). Não cria ZIP / não envia.")
+        print("ℹ️ Não houve XMLs do mês anterior. Não cria ZIP / não envia.")
         return
 
-    # Se tiver XML do período, envia ZIP com tudo que está na pasta (JSON + XML)
+    # Se tiver XML do período, envia ZIP (JSON + XML)
     tem_arquivos = False
     for _root, _dirs, files in os.walk(work_dir):
         if files:
@@ -621,7 +634,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
 
     try:
         zip_bytes = zipar_pasta_em_memoria(work_dir)
-        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs no período: {total_xml} | NSUs processados: {total_nsu_proc}")
+        print(f"   📦 ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs mês anterior: {total_xml} | JSONs OK: {total_json_ok}")
     except Exception as e:
         print("❌ Falha ao zipar:", e)
         return
