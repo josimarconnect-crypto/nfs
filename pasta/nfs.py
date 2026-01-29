@@ -69,7 +69,7 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 ADN_BASE = "https://adn.nfse.gov.br"
 
 START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
-MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
+MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "10000") or "10000")
 INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
 
 # Defaults conservadores pra evitar 429
