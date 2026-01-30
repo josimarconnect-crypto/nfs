@@ -1,3 +1,20 @@
+# nfs.py — Robô NFS-e (ADN) com:
+# ✅ Pula CPF (só CNPJ 14)
+# ✅ NSU por CNPJ na tabela nsu_nfs (lê + atualiza)
+# ✅ Salva TODOS os XMLs (mês atual e outros) em nfse_xml/<cnpj>/<AAAAMM>/...
+# ✅ Gera/atualiza ZIP do MÊS ANTERIOR a qualquer momento (se tiver novos XMLs)
+# ✅ Para empresa e NÃO avança NSU em: 404 NENHUM_DOCUMENTO_LOCALIZADO / 400 REJEICAO (E2214 etc)
+# ✅ Trata 429 com cooldown
+# ✅ Upload Storage via PUT + upsert=true (mais compatível)
+#
+# Requisitos:
+#   pip install requests lxml
+#
+# Dica (recomendado): use SERVICE_ROLE no backend para não bater em RLS do Storage.
+#   export SUPABASE_SERVICE_ROLE="xxxxx"
+#
+# Obs: não é seguro deixar keys no código em produção.
+
 # -*- coding: utf-8 -*-
 import os
 import re
@@ -22,21 +39,28 @@ from urllib3.util.retry import Retry
 from lxml import etree
 
 # =========================================================
-# === SUPABASE (CREDENCIAIS FIXAS) ========================
+# === SUPABASE ============================================
 # =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co")
+
+# ✅ prioridade: SERVICE_ROLE (ignora RLS) -> senão ANON
+SUPABASE_SERVICE_ROLE = os.getenv("SUPABASE_SERVICE_ROLE", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0MzcxNDA4MCwiZXhwIjoyMDU5MjkwMDgwfQ.cbeC4ROB7GXbKUU47nDpnQFeIYaEcvUr8_szTRxFZOs")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA")
+
+SUPABASE_KEY = SUPABASE_SERVICE_ROLE or SUPABASE_ANON_KEY
 
 TABELA_CERTS = "certifica_dfe"
 TABELA_NSU   = "nsu_nfs"
 
 BUCKET_STORAGE = "imagens"
 
-PASTA_XML    = "nfse_xml"       # XML solto
-PASTA_ZIPS   = "notas"          # ZIP do mês anterior
-PASTA_STATUS = "notas_status"   # status hash (pra saber se ZIP precisa atualizar)
+PASTA_XML    = "nfse_xml"         # XML solto
+PASTA_ZIPS   = "notas"            # ZIP do mês anterior
+PASTA_STATUS = "notas_status"     # hash p/ saber se ZIP mudou
 
 def supabase_headers(is_json: bool = False) -> Dict[str, str]:
+    if not SUPABASE_KEY or "COLE_SUA" in SUPABASE_KEY:
+        raise RuntimeError("Configure SUPABASE_SERVICE_ROLE (recomendado) ou SUPABASE_ANON_KEY.")
     h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     if is_json:
         h["Content-Type"] = "application/json"
@@ -48,12 +72,12 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 ADN_BASE = "https://adn.nfse.gov.br"
 
 START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
-MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "1000") or "1000")
+MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
 INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "90") or "90")
 
-# Evita 429
-ADN_WORKERS = int(os.getenv("ADN_WORKERS", "2") or "2")
-ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "10") or "10")
+# Evita 429 (não exagere)
+ADN_WORKERS    = int(os.getenv("ADN_WORKERS", "2") or "2")      # paralelismo
+ADN_BATCH_SIZE = int(os.getenv("ADN_BATCH_SIZE", "10") or "10") # bloco por rodada
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
@@ -212,7 +236,7 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str, str]:
     return cert_path, key_path, tmp_dir
 
 # =========================================================
-# STORAGE
+# STORAGE (Supabase) — PUT + upsert=true
 # =========================================================
 def storage_list(prefix: str, search: Optional[str] = None, limit: int = 1000) -> List[Dict[str, Any]]:
     prefix = prefix.strip("/")
@@ -255,11 +279,14 @@ def storage_upload(path: str, content: bytes, content_type: str, upsert: bool = 
     url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_STORAGE}/{path}"
     headers = supabase_headers()
     headers["Content-Type"] = content_type
+
     if upsert:
-        headers["x-upsert"] = "true"
-    r = requests.post(url, headers=headers, data=content, timeout=300)
+        url += "?upsert=true"
+
+    r = requests.put(url, headers=headers, data=content, timeout=300)
     if r.status_code in (200, 201):
         return True
+
     print(f"   ❌ Upload erro ({r.status_code}) {path}: {r.text[:250]}")
     return False
 
@@ -331,8 +358,36 @@ def xml_in_period(xml_str: str, data_ini: datetime, data_fim: datetime) -> bool:
         pass
     return False
 
+def extrair_mes_cod_do_xml(xml_str: str) -> Optional[str]:
+    """
+    Extrai AAAAMM do XML com base em tags que contenham 'data' ou 'compet'.
+    Se não achar, retorna None.
+    """
+    try:
+        root = etree.fromstring(xml_str.encode("utf-8", errors="ignore"))
+        nodes = root.xpath(
+            "//*[contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'data') "
+            "or contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'compet')]"
+        )
+        for n in nodes:
+            dt = parse_possible_date((n.text or "").strip())
+            if dt:
+                return dt.strftime("%Y%m")
+    except Exception:
+        pass
+    return None
+
 def xml_hash_short(xml_str: str) -> str:
     return hashlib.sha1(xml_str.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+def _extrair_codigo_erro(data_json: dict) -> str:
+    try:
+        errs = data_json.get("Erros") or []
+        if isinstance(errs, list) and errs:
+            return str(errs[0].get("Codigo") or "")
+    except Exception:
+        pass
+    return ""
 
 # =========================================================
 # SESSION mTLS
@@ -360,7 +415,7 @@ def criar_sessao_adn(cert_path: str, key_path: str) -> requests.Session:
     return s
 
 # =========================================================
-# save XML solto
+# save XML solto (SALVA TODOS OS MESES)
 # =========================================================
 def salvar_xml_solto_storage(cnpj: str, mes_cod: str, nsu: int, idx: int, xml_str: str) -> bool:
     cnpj = somente_numeros(cnpj)
@@ -377,35 +432,35 @@ def salvar_xml_solto_storage(cnpj: str, mes_cod: str, nsu: int, idx: int, xml_st
         return True
     return False
 
-def _extrair_codigo_erro(data_json: dict) -> str:
-    try:
-        errs = data_json.get("Erros") or []
-        if isinstance(errs, list) and errs:
-            return str(errs[0].get("Codigo") or "")
-    except Exception:
-        pass
-    return ""
-
 # =========================================================
 # downloader por NSU (paradas corretas)
 # =========================================================
-def baixar_e_salvar_xmls_mes_anterior_por_nsu(
+def baixar_e_salvar_xmls_por_nsu(
     s: requests.Session,
     cnpj: str,
     start_nsu: int,
     max_nsu: int,
     workers: int = ADN_WORKERS,
     batch_size: int = ADN_BATCH_SIZE,
-) -> Tuple[int, int, int, bool, str]:
+) -> Tuple[int, int, int, bool, str, int]:
+    """
+    Retorna:
+      total_xml_salvos_mes_anterior,
+      total_json_ok,
+      max_nsu_ok,
+      nao_avancar_nsu,
+      motivo_nao_avancar,
+      total_xml_salvos_geral
+    """
     data_ini, data_fim = mes_anterior_range_dt()
-    mes_cod, _ = mes_anterior_info()
 
     nsu_atual = int(start_nsu)
     limite = int(start_nsu) + int(max_nsu)
 
-    total_xml_salvos = 0
+    total_xml_mes_anterior = 0
+    total_xml_geral = 0
     total_json_ok = 0
-    max_nsu_ok = start_nsu - 1  # só NSU com 200+JSON válido
+    max_nsu_ok = start_nsu - 1  # só NSU com JSON OK
 
     nao_avancar_nsu = False
     motivo_nao_avancar = ""
@@ -526,24 +581,32 @@ def baixar_e_salvar_xmls_mes_anterior_por_nsu(
                     max_nsu_ok = nsu
 
                 xmls = find_xmls(data)
-                salvos_nsu = 0
-                for i, xml in enumerate(xmls, start=1):
-                    if xml_in_period(xml, data_ini, data_fim):
-                        if salvar_xml_solto_storage(cnpj=cnpj, mes_cod=mes_cod, nsu=nsu, idx=i, xml_str=xml):
-                            total_xml_salvos += 1
-                            salvos_nsu += 1
+                salvos_nsu_geral = 0
+                salvos_nsu_mes_ant = 0
 
-                print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs do mês anterior salvos: {salvos_nsu}")
+                for i, xml in enumerate(xmls, start=1):
+                    # ✅ salva TODOS os meses, baseado na data do XML
+                    mes_xml = extrair_mes_cod_do_xml(xml) or datetime.now(FUSO_RO).strftime("%Y%m")
+                    if salvar_xml_solto_storage(cnpj=cnpj, mes_cod=mes_xml, nsu=nsu, idx=i, xml_str=xml):
+                        total_xml_geral += 1
+                        salvos_nsu_geral += 1
+
+                        # ✅ conta separadamente os do mês anterior (pra log)
+                        if xml_in_period(xml, data_ini, data_fim):
+                            total_xml_mes_anterior += 1
+                            salvos_nsu_mes_ant += 1
+
+                print(f"[NSU {nsu}] OK - XMLs encontrados: {len(xmls)} | XMLs salvos (geral): {salvos_nsu_geral} | mês anterior: {salvos_nsu_mes_ant}")
 
         if stop_event.is_set():
             break
 
         nsu_atual = fim_lote
 
-    return total_xml_salvos, total_json_ok, max_nsu_ok, nao_avancar_nsu, motivo_nao_avancar
+    return total_xml_mes_anterior, total_json_ok, max_nsu_ok, nao_avancar_nsu, motivo_nao_avancar, total_xml_geral
 
 # =========================================================
-# ZIP auto-atualizável
+# ZIP auto-atualizável do mês anterior
 # =========================================================
 def _calc_state_hash(xml_names: List[str]) -> str:
     s = "\n".join(sorted(xml_names)).encode("utf-8", errors="ignore")
@@ -585,7 +648,7 @@ def gerar_zip_mes_anterior_para_empresa(cnpj: str, user: str, codi: Optional[int
             xml_names.append(nm)
 
     if not xml_names:
-        print(f"   ℹ️ Sem XMLs do mês {mes_cod} no Storage para cnpj={cnpj}. ZIP não gerado.")
+        print(f"   ℹ️ Sem XMLs do mês anterior {mes_cod} para cnpj={cnpj}. ZIP não gerado.")
         return
 
     new_hash = _calc_state_hash(xml_names)
@@ -593,18 +656,18 @@ def gerar_zip_mes_anterior_para_empresa(cnpj: str, user: str, codi: Optional[int
     old_hash = (old_status or {}).get("hash")
 
     if old_hash == new_hash:
-        print(f"   ℹ️ ZIP já está atualizado (sem mudanças): cnpj={cnpj} mes={mes_cod}")
+        print(f"   ℹ️ ZIP do mês anterior já está atualizado: cnpj={cnpj} mes={mes_cod}")
         return
 
     cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"
+    email = (user or "sem-user").replace("/", "_")
     zip_name = f"NFSE_{mes_cod}.zip"
     nome_final = f"{mes_cod}-{cod_str}-{cnpj}-{email}-{zip_name}"
     storage_zip_path = f"{PASTA_ZIPS}/{nome_final}"
 
-    print(f"   📦 Atualizando ZIP do mês {mes_cod}: {len(xml_names)} XMLs (cnpj={cnpj})...")
+    print(f"   📦 Atualizando ZIP do mês anterior {mes_cod}: {len(xml_names)} XMLs (cnpj={cnpj})...")
 
-    buf = tempfile.SpooledTemporaryFile(max_size=200 * 1024 * 1024)
+    buf = tempfile.SpooledTemporaryFile(max_size=300 * 1024 * 1024)
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         for nm in sorted(xml_names):
             obj_path = f"{prefix}/{nm}"
@@ -665,7 +728,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         print("❌ Erro ao criar sessão/cert:", e)
         return
 
-    xml_salvos, json_ok, max_nsu_ok, nao_avancar_nsu, motivo = baixar_e_salvar_xmls_mes_anterior_por_nsu(
+    xml_mes_ant, json_ok, max_nsu_ok, nao_avancar_nsu, motivo, xml_geral = baixar_e_salvar_xmls_por_nsu(
         s=s,
         cnpj=cnpj,
         start_nsu=start_nsu,
@@ -674,7 +737,7 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         batch_size=ADN_BATCH_SIZE,
     )
 
-    # só atualiza NSU se teve pelo menos 1 JSON OK
+    # ✅ Atualiza NSU somente se teve pelo menos 1 JSON OK e não caiu em "não avançar"
     if nao_avancar_nsu and json_ok == 0:
         print(f"ℹ️ Mantendo NSU antigo (não atualiza Supabase). Motivo: {motivo or 'NAO_AVANCAR'}")
     else:
@@ -683,9 +746,9 @@ def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
         else:
             print("ℹ️ Não atualizou NSU: nenhum JSON 200 processado.")
 
-    print(f"   🧾 XMLs do mês anterior salvos nesta rodada: {xml_salvos} | JSONs OK: {json_ok} | max_nsu_ok: {max_nsu_ok}")
+    print(f"   🧾 XMLs salvos nesta rodada: geral={xml_geral} | mês anterior={xml_mes_ant} | JSONs OK={json_ok} | max_nsu_ok={max_nsu_ok}")
 
-    # ✅ Atualiza ZIP só quando mudar
+    # ✅ Atualiza ZIP do mês anterior (sempre que detectar mudança)
     gerar_zip_mes_anterior_para_empresa(cnpj=cnpj, user=user, codi=codi)
 
 # =========================================================
@@ -750,7 +813,7 @@ if __name__ == "__main__":
     while True:
         mes_cod, mes_slug = mes_anterior_info()
         print("\n\n==================== NOVA VARREDURA NFS-e ====================")
-        print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')} | Mês anterior alvo: {mes_slug} ({mes_cod})")
+        print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')} | ZIP alvo: mês anterior {mes_slug} ({mes_cod})")
 
         try:
             processar_todas_empresas()
